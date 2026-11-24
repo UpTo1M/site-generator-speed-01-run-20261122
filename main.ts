@@ -22,6 +22,7 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 mkdirSync(OUTPUT_DIR, { recursive: true });
 
 const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8')) as { id: string; input: unknown }[];
-const answers: unknown[] = [];
-for (const c of cases) answers.push(run(c.input));
+// Pre-sized, filled by index: the case count is known, so the answers array never grows by push.
+const answers: unknown[] = new Array(cases.length);
+for (let k = 0; k < cases.length; k++) answers[k] = run(cases[k].input);
 writeFileSync(join(OUTPUT_DIR, 'answers.json'), JSON.stringify(answers));

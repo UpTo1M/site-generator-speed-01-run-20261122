@@ -1,13 +1,15 @@
-// solve.js — a faster drop-in for makefun-site 1.0.0 (site-generator-speed-01-run-20261122).
+// solve.js — a faster drop-in for makefun-site 1.0.0 (site-generator-speed-01-run-20261122), v2.
 //
 // run(input) returns exactly the answer makefun-site 1.0.0's build returns for the same input: the output
 // tree as a JSON object of every path it writes and that file's text, byte for byte. It is a fresh
 // implementation of the same rules (README.md of makefun-site 1.0.0 in the kit; the code is the reference
-// wherever the two differ), written for speed: bulk HTML escaping instead of one regex per character, a
-// single fused Markdown lex+render pass instead of token objects, allocation-free word counting, an ASCII
-// fast path for slugs, hand-rolled front-matter parsing, and a template renderer that writes into one
-// shared output array instead of concatenating a string per node. Nothing is cached from one case to the
-// next: every run(input) parses, renders and builds its case alone.
+// wherever the two differ), written for speed. v2 keeps v1's design and pushes the hot paths further: one
+// fused inline scan (a single regex finds markup characters and HTML-escape characters, so plain runs are
+// pushed raw with no second scan and no escape call), indexOf-based escaping for the remaining callers, no
+// per-item template scope objects (one scope/vars/loop record per for loop, mutated per item), word counting
+// fused into the Markdown renderer (each line counted once, raw, as it is consumed), one shared root
+// template scope per build, fast paths for link resolution, and a direct reserved-directory check. Nothing
+// is cached from one case to the next: every run(input) parses, renders and builds its case alone.
 
 /* ------------------------------------------------------------------ text */
 
@@ -16,9 +18,28 @@ const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&
 
 const ESCAPE_TEST = /[&<>"']/;
 
-/** `text` with & < > " and ' escaped. Only ever called on whole runs, never one character at a time. */
+/** The characters escapeHtml replaces, for the indexOf scan. */
+const ESCAPE_CHARS = ['&', '<', '>', '"', "'"];
+
+/** `text` with & < > " and ' escaped. Only ever called on whole runs, never one character at a time. The
+ * plain runs are found with C++ indexOf scans (one per special character, from the last cut) instead of a
+ * replace with a callback per match. */
 function escapeHtml(text) {
-  return ESCAPE_TEST.test(text) ? text.replace(/[&<>"']/g, (c) => ESCAPES[c]) : text;
+  if (!ESCAPE_TEST.test(text)) return text;
+  const out = [];
+  let last = 0;
+  for (;;) {
+    let j = text.length;
+    for (let q = 0; q < 5; q++) {
+      const k = text.indexOf(ESCAPE_CHARS[q], last);
+      if (k !== -1 && k < j) j = k;
+    }
+    if (j === text.length) break;
+    out.push(text.slice(last, j), ESCAPES[text[j]]);
+    last = j + 1;
+  }
+  out.push(text.slice(last));
+  return out.join('');
 }
 
 /** The most characters a slug keeps before a collision suffix. */
@@ -83,13 +104,6 @@ function wordsOf(text) {
       n++;
     }
   }
-  return n;
-}
-
-/** The words of lines joined by "\n": a word never spans a line end, so the sum is exact. */
-function wordsOfLines(lines) {
-  let n = 0;
-  for (let i = 0; i < lines.length; i++) n += wordsOf(lines[i]);
   return n;
 }
 
@@ -392,32 +406,43 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-/** The characters that can start inline markup. */
-const INLINE_CHARS = ['\\', '`', '*', '['];
-const INLINE_TEST = /[\\`*\[]/;
+/** The characters that can start inline markup or need HTML escaping, as one shared regex: a single C++ scan
+ * finds the next character that matters, so plain runs are pushed raw with no second scan and no escape call.
+ * Its lastIndex is set before every exec, so the recursion of inline into itself cannot disturb it. */
+const INLINE_RE = /[\x5c`*\x5b&<>"']/g;
 
 /**
- * `s` rendered inline; `env.link(target)` is a link's href. Text with no markup character at all is just
- * escaped (a single scan decides that). Otherwise plain runs are escaped in bulk: the next markup character
- * is found with four C++ scans (indexOf) instead of walking every character in JavaScript, and a backslash
- * that escapes nothing, a backtick, a star or a bracket with no partner is output literally, as the reference
- * does. (" is not an escapable character: \" stays a backslash and a quote.)
+ * `s` rendered inline; `env.link(target)` is a link's href. A backslash that escapes nothing, a backtick, a
+ * star or a bracket with no partner is output literally, as the reference does. (" is not an escapable
+ * character: \" stays a backslash and a quote.)
  */
 function inline(s, env) {
-  if (!INLINE_TEST.test(s)) return escapeHtml(s);
+  INLINE_RE.lastIndex = 0;
+  let m = INLINE_RE.exec(s);
+  if (m === null) return s;
   const out = [];
   let i = 0;
   const n = s.length;
-  while (i < n) {
-    let j = n;
-    for (let q = 0; q < 4; q++) {
-      const k = s.indexOf(INLINE_CHARS[q], i);
-      if (k !== -1 && k < j) j = k;
-    }
-    if (j > i) out.push(escapeHtml(s.slice(i, j)));
-    if (j === n) break;
+  while (m !== null) {
+    const j = m.index;
+    if (j > i) out.push(s.slice(i, j));
     const c = s[j];
-    if (c === '\\') {
+    if (c === '&') {
+      out.push('&amp;');
+      i = j + 1;
+    } else if (c === '<') {
+      out.push('&lt;');
+      i = j + 1;
+    } else if (c === '>') {
+      out.push('&gt;');
+      i = j + 1;
+    } else if (c === '"') {
+      out.push('&quot;');
+      i = j + 1;
+    } else if (c === "'") {
+      out.push('&#39;');
+      i = j + 1;
+    } else if (c === '\\') {
       if (j + 1 < n && ESCAPABLE.has(s[j + 1])) {
         out.push(ESCAPES[s[j + 1]] ?? s[j + 1]);
         i = j + 2;
@@ -425,9 +450,7 @@ function inline(s, env) {
         out.push('\\');
         i = j + 1;
       }
-      continue;
-    }
-    if (c === '`') {
+    } else if (c === '`') {
       const k = s.indexOf('`', j + 1);
       if (k > j + 1) {
         out.push('<code>', escapeHtml(s.slice(j + 1, k)), '</code>');
@@ -436,9 +459,7 @@ function inline(s, env) {
         out.push('`');
         i = j + 1;
       }
-      continue;
-    }
-    if (c === '*') {
+    } else if (c === '*') {
       if (s[j + 1] === '*') {
         const k = findUnescaped(s, '**', j + 2);
         if (k > j + 2) {
@@ -458,19 +479,22 @@ function inline(s, env) {
           i = j + 1;
         }
       }
-      continue;
-    }
-    const k = findUnescaped(s, ']', j + 1);
-    const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-    const target = m === -1 ? '' : s.slice(k + 2, m);
-    if (target !== '' && !/\s/.test(target)) {
-      out.push('<a href="', escapeHtml(env.link(target)), '">', inline(s.slice(j + 1, k), env), '</a>');
-      i = m + 1;
     } else {
-      out.push('[');
-      i = j + 1;
+      const k = findUnescaped(s, ']', j + 1);
+      const close = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const target = close === -1 ? '' : s.slice(k + 2, close);
+      if (target !== '' && !/\s/.test(target)) {
+        out.push('<a href="', escapeHtml(env.link(target)), '">', inline(s.slice(j + 1, k), env), '</a>');
+        i = close + 1;
+      } else {
+        out.push('[');
+        i = j + 1;
+      }
     }
+    INLINE_RE.lastIndex = i;
+    m = INLINE_RE.exec(s);
   }
+  if (i < n) out.push(s.slice(i));
   return out.join('');
 }
 
@@ -485,6 +509,10 @@ function renderMarkdown(lines, env) {
   const blocks = [];
   const toc = [];
   let excerpt = null;
+  // The body's word count, for reading_minutes: every line is counted exactly once, raw, as it is consumed
+  // here, so the separate wordsOfLines pass over the lines is gone. A line's words are its runs of
+  // non-whitespace, the same count wordsOfLines gave.
+  let words = 0;
   let i = 0;
   const n = lines.length;
   while (i < n) {
@@ -498,6 +526,7 @@ function renderMarkdown(lines, env) {
       // '#': only a heading can start here.
       const heading = headingOf(line);
       if (heading !== null) {
+        words += wordsOf(line);
         const id = uniqueSlug(slugify(heading.text), ids);
         const html = inline(heading.text, env);
         blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>\n`);
@@ -509,9 +538,14 @@ function renderMarkdown(lines, env) {
       // '`': only a fence can start here.
       const fence = fenceOpen(line);
       if (fence !== null) {
+        words += wordsOf(line);
         const body = [];
         i++;
-        while (i < n && !fenceClose(lines[i])) body.push(lines[i++]);
+        while (i < n && !fenceClose(lines[i])) {
+          words += wordsOf(lines[i]);
+          body.push(lines[i++]);
+        }
+        if (i < n) words += wordsOf(lines[i]);
         i++;
         const cls = fence === '' ? '' : ` class="language-${fence}"`;
         blocks.push(`<pre><code${cls}>${body.length === 0 ? '' : `${escapeHtml(body.join('\n'))}\n`}</code></pre>\n`);
@@ -520,6 +554,7 @@ function renderMarkdown(lines, env) {
     } else if (c0 === 45 || c0 === 42) {
       // '-' or '*': a thematic break first, then a bullet item.
       if (isHr(line)) {
+        words += wordsOf(line);
         blocks.push('<hr>\n');
         i++;
         continue;
@@ -530,11 +565,13 @@ function renderMarkdown(lines, env) {
           const cur = lines[i];
           const b = bulletOf(cur);
           if (b !== null) {
+            words += wordsOf(cur);
             items.push([trimLine(b)]);
             i++;
             continue;
           }
           if (cur.charCodeAt(0) === 32 && cur.charCodeAt(1) === 32 && CONTINUED.test(cur)) {
+            words += wordsOf(cur);
             items[items.length - 1].push(trimLine(cur));
             i++;
             continue;
@@ -551,6 +588,7 @@ function renderMarkdown(lines, env) {
       // '>': a blockquote.
       const body = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
+        words += wordsOf(lines[i]);
         let l = lines[i++];
         l = l.slice(1);
         if (l.charCodeAt(0) === 32) l = l.slice(1);
@@ -569,11 +607,13 @@ function renderMarkdown(lines, env) {
           const cur = lines[i];
           const o = orderedOf(cur);
           if (o !== null) {
+            words += wordsOf(cur);
             items.push([trimLine(o.text)]);
             i++;
             continue;
           }
           if (cur.charCodeAt(0) === 32 && cur.charCodeAt(1) === 32 && CONTINUED.test(cur)) {
+            words += wordsOf(cur);
             items[items.length - 1].push(trimLine(cur));
             i++;
             continue;
@@ -594,13 +634,17 @@ function renderMarkdown(lines, env) {
       }
     }
     const body = [trimLine(line)];
+    words += wordsOf(line);
     i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
+    while (i < n && !endsParagraph(lines[i])) {
+      words += wordsOf(lines[i]);
+      body.push(trimLine(lines[i++]));
+    }
     const html = inline(body.join('\n'), env);
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>\n`);
   }
-  return { html: blocks.join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.join(''), toc, excerpt: excerpt ?? '', words };
 }
 
 /* --------------------------------------------------------------- Templates */
@@ -763,9 +807,20 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       case 'for': {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
+        // One scope, one vars object and one loop record for the whole loop, mutated per item: rendering is
+        // synchronous and nothing retains a scope, so the per-item objects the reference shape builds are pure
+        // allocation. The item is written before `loop`, as in the object literal this replaces, so a loop
+        // variable actually named "loop" still loses to the loop record.
+        const vars = {};
+        const loop = { index: 0, first: false, last: false, length: xs.length };
+        const child = { vars, parent: scope };
         for (let k = 0; k < xs.length; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-          renderNodes(n.body, { vars, parent: scope }, ctx, depth, out);
+          vars[n.name] = xs[k];
+          vars.loop = loop;
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === xs.length - 1;
+          renderNodes(n.body, child, ctx, depth, out);
         }
         break;
       }
@@ -791,6 +846,13 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 /** `rel` (a link's path, "/"-separated) from the directory `dir` of a source, or null when it climbs out of the root. */
 function resolvePath(dir, rel) {
+  // Fast path: no "..", "." or empty segment, so the walk just pushes every segment: dir + "/" + rel.
+  if (
+    !rel.includes('..') && !rel.includes('//') && rel !== '.' &&
+    !rel.startsWith('./') && !rel.includes('/./') && !rel.endsWith('/.') && !rel.endsWith('/')
+  ) {
+    return dir === '' ? rel : `${dir}/${rel}`;
+  }
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -824,9 +886,8 @@ function frontMatter(b) {
     }
     s.data = fm.data;
     s.bodyLines = fm.lines;
-    s.words = wordsOfLines(fm.lines);
     s.post = s.path.startsWith('posts/');
-    const own = RESERVED.find((d) => d !== 'posts' && s.path.startsWith(`${d}/`));
+    const own = s.path.startsWith('tags/') ? 'tags' : s.path.startsWith('page/') ? 'page' : undefined;
     if (own !== undefined) {
       b.report.push(`refused ${s.path}: ${own}/ is the generator's own`);
       continue;
@@ -874,7 +935,24 @@ function markdown(b) {
     const dir = dirOf(s.path);
     const env = {
       link: (target) => {
-        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
+        // Absolute, fragment-only, or scheme targets pass through: the scheme test is a colon scan plus a
+        // short character check, not a regex.
+        const c0 = target.charCodeAt(0);
+        if (c0 === 47 || c0 === 35) return target;
+        if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) {
+          const colon = target.indexOf(':');
+          if (colon > 0) {
+            let scheme = true;
+            for (let q = 1; q < colon; q++) {
+              const c = target.charCodeAt(q);
+              if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46)) {
+                scheme = false;
+                break;
+              }
+            }
+            if (scheme) return target;
+          }
+        }
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
@@ -889,6 +967,7 @@ function markdown(b) {
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
+    s.words = md.words;
   }
 }
 
@@ -991,11 +1070,20 @@ function layouts(b) {
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
   const ctx = { templates: b.templates, escape: escapeHtml };
+  // One root scope for the whole build, its vars mutated per render and the render's own keys deleted
+  // after: rendering is synchronous and nothing retains a scope, so the fresh spread object and scope
+  // object per page are pure allocation. A key a render does not pass cannot leak in from an earlier render,
+  // because every key set is deleted before the next render starts.
+  const rootVars = { site, tags: allTags, recent };
+  const rootScope = { vars: rootVars, parent: null };
   const render = (name, vars) => {
     const nodes = b.templates.get(name);
     if (nodes === undefined) return null;
+    const keys = Object.keys(vars);
+    for (let k = 0; k < keys.length; k++) rootVars[keys[k]] = vars[keys[k]];
     const out = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+    renderNodes(nodes, rootScope, ctx, 0, out);
+    for (let k = 0; k < keys.length; k++) delete rootVars[keys[k]];
     return out.join('');
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s, s.post ? b.cards.get(s) : cardOf(s)) });
